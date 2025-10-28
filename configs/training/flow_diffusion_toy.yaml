@@ -1,0 +1,57 @@
+# Toy Flow-based Diffusion Model Configuration
+# Minimal configuration for testing
+
+model:
+  base_learning_rate: 1.0e-3
+  target: sgm.models.score_flow.FlowDiffusionEngine
+  params:
+    input_key: jpg
+    scale_factor: 1.0
+
+    score_network_config:
+      target: sgm.models.score_flow.ScoreFlowNetwork
+      params:
+        data_dim: 64  # Small dimension for toy data
+        n_flows: 2
+        activation: softplus
+        activation_params:
+          beta: 1.0
+        sigma_embed_dim: 128
+        cond_embed_dim: 64
+        use_conditioning: false
+
+    conditioner_config:
+      target: sgm.modules.GeneralConditioner
+      params:
+        emb_models: []
+
+    first_stage_config:
+      target: sgm.models.autoencoder.IdentityFirstStage
+
+    loss_fn_config:
+      target: sgm.modules.diffusionmodules.loss.StandardDiffusionLoss
+      params:
+        loss_weighting_config:
+          target: sgm.modules.diffusionmodules.loss_weighting.EDMWeighting
+          params:
+            sigma_data: 1.0
+        sigma_sampler_config:
+          target: sgm.modules.diffusionmodules.sigma_sampling.EDMSampling
+
+    optimizer_config:
+      target: torch.optim.Adam
+      params:
+        lr: 1.0e-3
+
+data:
+  target: sgm.data.mnist.MNISTLoader
+  params:
+    batch_size: 128
+    num_workers: 2
+
+lightning:
+  trainer:
+    devices: 0,
+    benchmark: true
+    num_sanity_val_steps: 0
+    max_epochs: 20
