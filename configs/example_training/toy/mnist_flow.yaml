@@ -1,0 +1,113 @@
+# Flow-based Diffusion for MNIST
+# Uses ScoreFlowNetwork instead of UNet
+# All other components (denoiser, loss, VAE) are official
+
+model:
+  base_learning_rate: 1.0e-4
+  target: sgm.models.diffusion.DiffusionEngine
+  params:
+    input_key: jpg  # MNIST returns {"jpg": image, "cls": label}
+    scale_factor: 1.0
+    disable_first_stage_autocast: True
+
+    # ScoreFlowNetwork replaces UNet
+    network_config:
+      target: sgm.modules.diffusionmodules.score_flow_network.ScoreFlowNetwork
+      params:
+        in_channels: 1  # MNIST grayscale
+        model_channels: 128
+        n_flows: 3
+        activation: softplus
+        activation_params:
+          beta: 1.0
+        num_classes: 10  # MNIST classes
+        sigma_data: 0.5  # Must match denoiser EDMScaling
+
+    # Official Denoiser (EDM style)
+    denoiser_config:
+      target: sgm.modules.diffusionmodules.denoiser.Denoiser
+      params:
+        scaling_config:
+          target: sgm.modules.diffusionmodules.denoiser_scaling.EDMScaling
+          params:
+            sigma_data: 0.5
+
+    # Conditioner: class labels
+    conditioner_config:
+      target: sgm.modules.GeneralConditioner
+      params:
+        emb_models:
+          - is_trainable: True
+            input_key: cls  # MNIST returns {"jpg": image, "cls": label}
+            ucg_rate: 0.1  # 10% unconditional
+            target: sgm.modules.encoders.modules.ClassEmbedder
+            params:
+              embed_dim: 512
+              n_classes: 10
+
+    # Identity first stage (no VAE for MNIST)
+    first_stage_config:
+      target: sgm.models.autoencoder.IdentityFirstStage
+      params:
+        scale_factor: 1.0
+
+    # Official Loss function
+    loss_fn_config:
+      target: sgm.modules.diffusionmodules.loss.StandardDiffusionLoss
+      params:
+        loss_type: l2
+        offset_noise_level: 0.0
+        sigma_sampler_config:
+          target: sgm.modules.diffusionmodules.sigma_sampling.EDMSampling
+          params:
+            p_mean: -1.2
+            p_std: 1.2
+        loss_weighting_config:
+          target: sgm.modules.diffusionmodules.loss_weighting.EDMWeighting
+          params:
+            sigma_data: 0.5
+
+    # Optimizer
+    optimizer_config:
+      target: torch.optim.AdamW
+      params:
+        lr: 1.0e-4
+        betas: [0.9, 0.999]
+        weight_decay: 0.01
+
+    # No EMA for toy example
+    use_ema: False
+
+data:
+  target: sgm.data.mnist.MNISTLoader
+  params:
+    batch_size: 256
+    num_workers: 4
+
+lightning:
+  modelcheckpoint:
+    params:
+      every_n_train_steps: 5000
+      save_top_k: 3
+      monitor: train/loss
+
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        disabled: False
+        batch_frequency: 1000
+        max_images: 16
+        increase_log_steps: False
+        log_first_step: False
+        log_images_kwargs:
+          N: 16
+
+  trainer:
+    devices: 1
+    accelerator: gpu
+    benchmark: True
+    num_sanity_val_steps: 0
+    accumulate_grad_batches: 1
+    max_epochs: 50
+    gradient_clip_val: 1.0
