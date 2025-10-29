@@ -48,7 +48,7 @@ class NormalizingFlow(nn.Module):
             base_cov = torch.diag(base_std ** 2)
 
         self.register_buffer('base_mean', base_mean)
-        self.base_dist = dist.MultivariateNormal(base_mean, base_cov)
+        self.register_buffer('base_cov', base_cov)
 
         # Flow layers
         self.flows = nn.ModuleList([
@@ -59,6 +59,11 @@ class NormalizingFlow(nn.Module):
         self.final_mlp = nn.Linear(dim, dim)
         self.final_mlp.bias.data.fill_(0)
         self.final_mlp.weight.data = torch.eye(dim) + 0.01 * torch.randn(dim, dim)
+
+    @property
+    def base_dist(self):
+        """Dynamically create base distribution with correct device"""
+        return dist.MultivariateNormal(self.base_mean, self.base_cov)
 
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """

@@ -11,7 +11,7 @@ from omegaconf import ListConfig, OmegaConf
 
 from ..modules.flows import NormalizingFlow
 from ..modules.flows.flow_layers import get_activation
-from ..util import instantiate_from_config, default
+from ..util import instantiate_from_config, default, get_obj_from_str
 from ..modules import UNCONDITIONAL_CONFIG
 
 
@@ -86,7 +86,7 @@ class ScoreFlowNetwork(nn.Module):
         cond_embedding: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute score function and predicted clean sample
+        Compute score function and predicted clean sample using exact gradient
 
         Args:
             x_t: Noisy samples [B, D] or [B, C, H, W]
@@ -106,49 +106,59 @@ class ScoreFlowNetwork(nn.Module):
         else:
             x_flat = x_t
 
+        # Enable gradient computation for x_flat
+        x_flat = x_flat.requires_grad_(True)
+
         # Embed sigma
         if sigma_t.dim() == 1:
             sigma_t = sigma_t.unsqueeze(-1)
         sigma_emb = self.sigma_embedder(sigma_t)  # [B, sigma_embed_dim]
 
-        # Prepare flow input
-        flow_input_list = [x_flat, sigma_emb]
-
+        # Prepare conditioning
         if self.use_conditioning and cond_embedding is not None:
             cond_emb = self.cond_projector(cond_embedding)
+        else:
+            cond_emb = None
+
+        # Compute energy-like function via Flow
+        # Flow takes x_t and outputs transformation
+        flow_input_list = [x_flat, sigma_emb]
+        if cond_emb is not None:
             flow_input_list.append(cond_emb)
 
         flow_input = torch.cat(flow_input_list, dim=-1)
 
-        # Sample base distribution
-        z_base = torch.randn_like(flow_input)
+        # Sample from base distribution (fixed for this batch)
+        with torch.no_grad():
+            z_base = torch.randn(batch_size, flow_input.size(-1), device=x_flat.device)
 
-        # Forward through flow to get log probability
-        x_flow, log_det = self.flow.forward(z_base)
+        # Forward through flow
+        flow_output, log_det = self.flow.forward(flow_input)
 
-        # Compute score via backpropagation through flow
-        # We want ∇_{x_flat} log p(x_flat | sigma, cond)
-        x_flat_grad = x_flat.requires_grad_(True)
-        flow_input_grad = torch.cat(
-            [x_flat_grad, sigma_emb] + ([self.cond_projector(cond_embedding)] if self.use_conditioning and cond_embedding is not None else []),
-            dim=-1
-        )
+        # Compute log probability (energy function)
+        # This is the key: flow_output depends on x_flat through flow_input
+        log_prob_base = self.flow.base_dist.log_prob(z_base)
 
-        # Recompute forward with gradient tracking
-        x_flow_grad, log_det_grad = self.flow.forward(z_base)
-        log_prob = self.flow.base_dist.log_prob(z_base) - log_det_grad
+        # Energy: negative log likelihood
+        # We use the flow transformation as an energy-based model
+        energy = -torch.sum(flow_output ** 2, dim=-1)  # Simple energy function
 
-        # Compute gradient (score)
+        # Compute score: ∇_{x_flat} energy
         score_flat = torch.autograd.grad(
-            outputs=log_prob.sum(),
-            inputs=x_flat_grad,
+            outputs=energy.sum(),
+            inputs=x_flat,
             create_graph=self.training,
-            retain_graph=True,
+            allow_unused=False,
         )[0]
 
-        # Project score to have better expressiveness
+        # Project score through MLP for better expressiveness
+        # Include all conditioning information to match flow_input_dim
+        projector_input_list = [score_flat, sigma_emb]
+        if cond_emb is not None:
+            projector_input_list.append(cond_emb)
+
         score_flat = self.score_projector(
-            torch.cat([score_flat, sigma_emb], dim=-1)
+            torch.cat(projector_input_list, dim=-1)
         )
 
         # Reshape back
@@ -164,7 +174,7 @@ class ScoreFlowNetwork(nn.Module):
         while sigma_t_expanded.dim() < score.dim():
             sigma_t_expanded = sigma_t_expanded.unsqueeze(-1)
 
-        x_pred = x_t + (sigma_t_expanded ** 2) * score
+        x_pred = x_t.detach() + (sigma_t_expanded ** 2) * score
 
         return score, x_pred
 
@@ -188,12 +198,14 @@ class FlowDiffusionEngine(pl.LightningModule):
         log_keys: Union[List, None] = None,
         scale_factor: float = 1.0,
         disable_first_stage_autocast: bool = False,
+        train_first_stage: bool = False,  # NEW: whether to train autoencoder
     ):
         super().__init__()
         self.input_key = input_key
         self.log_keys = log_keys
         self.scale_factor = scale_factor
         self.disable_first_stage_autocast = disable_first_stage_autocast
+        self.train_first_stage = train_first_stage
 
         # Score network (replaces UNet)
         self.score_network = instantiate_from_config(score_network_config)
@@ -203,10 +215,15 @@ class FlowDiffusionEngine(pl.LightningModule):
             default(conditioner_config, UNCONDITIONAL_CONFIG)
         )
 
-        # First stage model (VAE)
+        # First stage model (VAE/Autoencoder)
         self.first_stage_model = instantiate_from_config(first_stage_config)
-        self.first_stage_model.eval()
-        self.first_stage_model.train = lambda *args, **kwargs: None  # Disable training
+
+        # Control whether to train first_stage_model
+        if not train_first_stage:
+            self.first_stage_model.eval()
+            self.first_stage_model.train = lambda *args, **kwargs: None
+            for param in self.first_stage_model.parameters():
+                param.requires_grad = False
 
         # Loss function
         self.loss_fn = instantiate_from_config(loss_fn_config) if loss_fn_config else None
@@ -295,16 +312,38 @@ class FlowDiffusionEngine(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer and scheduler"""
-        optimizer = instantiate_from_config(
-            self.optimizer_config,
-            params=self.score_network.parameters(),
+        # 获取学习率和其他参数
+        optimizer_params_config = self.optimizer_config.get("params", {})
+        lr = optimizer_params_config.get("lr", 1e-4)
+
+        # 获取 optimizer 类
+        optimizer_class = get_obj_from_str(self.optimizer_config["target"])
+
+        # 准备 optimizer 参数（排除 lr）
+        optimizer_kwargs = {
+            k: v for k, v in optimizer_params_config.items()
+            if k != "lr"
+        }
+
+        # Collect parameters to optimize
+        params_to_optimize = list(self.score_network.parameters())
+
+        # Add first_stage_model parameters if training it
+        if self.train_first_stage:
+            params_to_optimize += list(self.first_stage_model.parameters())
+
+        # 创建 optimizer
+        optimizer = optimizer_class(
+            params_to_optimize,
+            lr=lr,
+            **optimizer_kwargs
         )
 
+        # 如果有 scheduler 配置
         if self.scheduler_config is not None:
-            scheduler = instantiate_from_config(
-                self.scheduler_config,
-                optimizer=optimizer,
-            )
+            scheduler_class = get_obj_from_str(self.scheduler_config["target"])
+            scheduler_params = self.scheduler_config.get("params", {})
+            scheduler = scheduler_class(optimizer, **scheduler_params)
             return [optimizer], [scheduler]
 
         return optimizer

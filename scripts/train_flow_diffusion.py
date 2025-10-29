@@ -147,9 +147,11 @@ def main():
         filename="{epoch:06}",
         verbose=True,
         save_last=True,
+        monitor="train/loss",  # 添加这行，监控训练损失
+        mode="min",  # 损失越小越好
         every_n_train_steps=config.get("lightning", {}).get("modelcheckpoint", {}).get("params", {}).get("every_n_train_steps", 5000),
         save_top_k=config.get("lightning", {}).get("modelcheckpoint", {}).get("params", {}).get("save_top_k", 3),
-    )
+        )
     callbacks.append(checkpoint_callback)
 
     # Learning rate monitor
